@@ -126,37 +126,37 @@ def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
 
 
 
+
 def compute_overtime(
-    punch_out: datetime, shift_end: str, date_str: str
+    punch_out: datetime,
+    shift_start: str,
+    shift_end: str,
+    date_str: str,
 ) -> int:
     local_out = as_ist(punch_out)
     attendance_day = date.fromisoformat(date_str)
 
-    start_h, start_m = map(int, "00:00".split(":"))
-    end_h, end_m = map(int, shift_end.split(":"))
+    start_hour, start_minute = map(int, shift_start.split(":"))
+    end_hour, end_minute = map(int, shift_end.split(":"))
 
-    shift_start = datetime(
-        attendance_day.year,
-        attendance_day.month,
-        attendance_day.day,
-        0,
-        0,
+    shift_end_day = attendance_day
+    if shift_end <= shift_start:
+        shift_end_day += timedelta(days=1)
+
+    shift_end_dt = datetime(
+        shift_end_day.year,
+        shift_end_day.month,
+        shift_end_day.day,
+        end_hour,
+        end_minute,
         tzinfo=IST,
     )
-
-    shift_end_dt = shift_start.replace(
-        hour=end_h,
-        minute=end_m,
-    )
-
-    # Overnight shift: its end is on the following calendar day.
-    if shift_end <= "09:30":
-        shift_end_dt += timedelta(days=1)
 
     elapsed_seconds = int((local_out - shift_end_dt).total_seconds())
     overtime_minutes = elapsed_seconds // 60
 
     return overtime_minutes if overtime_minutes >= 30 else 0
+
 
 
 
@@ -238,8 +238,12 @@ def punch_out(body: PunchOutIn):
 
     work_hours = compute_work_hours(punch_in_value, punch_out_utc)
     half_day = work_hours < 4.50
+    
     overtime_minutes = compute_overtime(
-        ts, emp["shift_end"], record["date"]
+        ts,
+        emp["shift_start"],
+        emp["shift_end"],
+        record["date"],
     )
 
     result = db.attendance_logs.update_one(
@@ -702,13 +706,24 @@ def department_summary(month: str, department: Optional[str] = None):
                             "as": "log",
                             "in": {
                                 "$cond": [
-                                    {"$lt": [{"$dayOfWeek": {
-                                        "date": {
-                                            "$dateFromString": {
-                                                "dateString": "$$log.date"
-                                            }
-                                        }
-                                    }}, 7]},
+                                  
+{"$and": [
+    {"$gte": [{"$dayOfWeek": {
+        "date": {
+            "$dateFromString": {
+                "dateString": "$$log.date"
+            }
+        }
+    }}, 2]},
+    {"$lte": [{"$dayOfWeek": {
+        "date": {
+            "$dateFromString": {
+                "dateString": "$$log.date"
+            }
+        }
+    }}, 6]}
+]},
+
                                     {
                                         "$cond": [
                                             {"$eq": ["$$log.half_day", True]},
