@@ -12,3 +12,9 @@ htmlcov/
 .idea/
 .vscode/
 .DS_Store
+
+app/main_backup.py
+app/main_before_trend_backup.py
+app/main_broken_backup.py
+app/main_progress_backup.py
+app/main_trend_working_backup.py

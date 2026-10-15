@@ -394,6 +394,7 @@ def punch_in(body: PunchInIn):
     return doc
 
 
+
 @app.get("/attendance")
 def list_attendance(
     emp_code: Optional[str] = None,
@@ -403,24 +404,114 @@ def list_attendance(
     page: int = 1,
     page_size: int = 20,
 ):
-    q = {}
-    if emp_code:
-        q["emp_code"] = emp_code
-    if date_from or date_to:
-        q["date"] = {}
+    from datetime import date
+    from fastapi import HTTPException
+
+    if page < 1:
+        raise HTTPException(
+            status_code=422,
+            detail="page must be at least 1",
+        )
+
+    if page_size < 1 or page_size > 100:
+        raise HTTPException(
+            status_code=422,
+            detail="page_size must be between 1 and 100",
+        )
+
+    # Validate date filters and their order.
+    try:
         if date_from:
-            q["date"]["$gte"] = date_from
+            date.fromisoformat(date_from)
         if date_to:
-            q["date"]["$lte"] = date_to
+            date.fromisoformat(date_to)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail="Dates must use YYYY-MM-DD format",
+        )
+
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(
+            status_code=422,
+            detail="date_from cannot be after date_to",
+        )
+
+    # Build the MongoDB query.
+    query = {}
+
+    if emp_code:
+        query["emp_code"] = emp_code
+
     if status:
-        q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
-    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
+        allowed_statuses = {
+            "PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"
+        }
+        if status not in allowed_statuses:
+            raise HTTPException(
+                status_code=422,
+                detail="Invalid attendance status",
+            )
+        query["status"] = status
+
+    if date_from or date_to:
+        date_filter = {}
+        if date_from:
+            date_filter["$gte"] = date_from
+        if date_to:
+            date_filter["$lte"] = date_to
+        query["date"] = date_filter
+
+    # Count and paginate in MongoDB.
+    total = db.attendance_logs.count_documents(query)
+
+    docs = list(
+        db.attendance_logs.find(query, {"_id": 1, "emp_code": 1,
+            "date": 1, "status": 1, "punch_in": 1, "punch_out": 1,
+            "work_hours": 1, "late_minutes": 1,
+            "overtime_minutes": 1, "half_day": 1, "history": 1})
+        .sort([("date", -1), ("emp_code", 1)])
+        .skip((page - 1) * page_size)
+        .limit(page_size)
+    )
+
+    # Convert database values to API-safe values.
+    items = []
+    for doc in docs:
+        doc["id"] = str(doc.pop("_id"))
+
+        for field in ("punch_in", "punch_out"):
+            value = doc.get(field)
+            if value is not None:
+                if value.tzinfo is None:
+                    value = value.replace(tzinfo=timezone.utc)
+                doc[field] = int(value.timestamp() * 1000)
+
+        for entry in doc.get("history", []):
+            if entry.get("at") is not None:
+                value = entry["at"]
+                if value.tzinfo is None:
+                    value = value.replace(tzinfo=timezone.utc)
+                entry["at"] = int(value.timestamp() * 1000)
+
+            for change in entry.get("changes", {}).values():
+                if not isinstance(change, dict):
+                    continue
+                for key in ("from", "to"):
+                    value = change.get(key)
+                    if isinstance(value, datetime):
+                        if value.tzinfo is None:
+                            value = value.replace(tzinfo=timezone.utc)
+                        change[key] = int(value.timestamp() * 1000)
+
+        items.append(doc)
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
 
 
 @app.get("/analytics/employees/{emp_code}/monthly")
