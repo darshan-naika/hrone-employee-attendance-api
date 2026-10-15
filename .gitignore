@@ -20,3 +20,7 @@ app/main_progress_backup.py
 app/main_trend_working_backup.py
 
 app/main_before_explain_fix.py
+
+# Local backup and sample data files
+app/main_before_monthly_fix.py
+sample_data/

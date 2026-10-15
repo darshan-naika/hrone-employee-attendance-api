@@ -518,11 +518,9 @@ def list_attendance(
     }
 
 
+
 @app.get("/analytics/employees/{emp_code}/monthly")
 def employee_monthly_analytics(emp_code: str, month: str):
-    import re
-    from decimal import Decimal, ROUND_HALF_UP
-
     if not re.fullmatch(r"\d{4}-\d{2}", month):
         raise HTTPException(
             status_code=422,
@@ -533,61 +531,114 @@ def employee_monthly_analytics(emp_code: str, month: str):
         year, month_num = map(int, month.split("-"))
         first_day = date(year, month_num, 1)
     except ValueError:
-        raise HTTPException(
-            status_code=422,
-            detail="Invalid month",
-        )
+        raise HTTPException(status_code=422, detail="Invalid month")
 
-    employee = db.employees.find_one({"emp_code": emp_code})
+    employee = db.employees.find_one(
+        {"emp_code": emp_code},
+        {"_id": 0, "emp_code": 1, "joined_on": 1},
+    )
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
 
-    last_day_num = calendar.monthrange(year, month_num)[1]
-    last_day = date(year, month_num, last_day_num)
-
+    last_day = date(year, month_num, calendar.monthrange(year, month_num)[1])
     joined_on = date.fromisoformat(employee["joined_on"])
-    working_days = 0
-    current = max(first_day, joined_on)
+    working_start = max(first_day, joined_on)
 
+    working_days = 0
+    current = working_start
     while current <= last_day:
         if current.weekday() < 5:
             working_days += 1
         current += timedelta(days=1)
 
-    logs = list(
-        db.attendance_logs.find(
-            {
+    pipeline = [
+        {
+            "$match": {
                 "emp_code": emp_code,
                 "date": {
                     "$gte": first_day.isoformat(),
                     "$lte": last_day.isoformat(),
                 },
-            },
-            {"_id": 0},
-        )
-    )
+            }
+        },
+        {
+            "$group": {
+                "_id": None,
+                "present_days": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {
+                                        "$in": [
+                                            "$status",
+                                            ["PRESENT", "WFH", "ON_DUTY"],
+                                        ]
+                                    },
+                                    {
+                                        "$lt": [
+                                            {
+                                                "$dayOfWeek": {
+                                                    "$dateFromString": {
+                                                        "dateString": "$date"
+                                                    }
+                                                }
+                                            },
+                                            7,
+                                        ]
+                                    },
+                                    {
+                                        "$gt": [
+                                            {
+                                                "$dayOfWeek": {
+                                                    "$dateFromString": {
+                                                        "dateString": "$date"
+                                                    }
+                                                }
+                                            },
+                                            1,
+                                        ]
+                                    },
+                                ]
+                            },
+                            {
+                                "$cond": [
+                                    {"$eq": ["$half_day", True]},
+                                    0.5,
+                                    1.0,
+                                ]
+                            },
+                            0,
+                        ]
+                    }
+                },
+                "leave_days": {
+                    "$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}
+                },
+                "late_count": {
+                    "$sum": {
+                        "$cond": [{"$gt": ["$late_minutes", 0]}, 1, 0]
+                    }
+                },
+            }
+        },
+    ]
 
-    present_days = 0.0
-    leave_days = 0
-    late_count = 0
+    results = list(db.attendance_logs.aggregate(pipeline))
+    result = results[0] if results else {}
 
-    for log in logs:
-        status = log.get("status")
-
-        if status in {"PRESENT", "WFH", "ON_DUTY"}:
-            if date.fromisoformat(log["date"]).weekday() < 5:
-                present_days += 0.5 if log.get("half_day", False) else 1.0
-        elif status == "LEAVE":
-            leave_days += 1
-
-        if log.get("late_minutes", 0) > 0:
-            late_count += 1
+    present_days = float(result.get("present_days", 0))
+    leave_days = int(result.get("leave_days", 0))
+    late_count = int(result.get("late_count", 0))
 
     attendance_pct = None
     if working_days > 0:
-        pct = Decimal(str(present_days)) / Decimal(working_days) * 100
         attendance_pct = float(
-            pct.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            (
+                Decimal(str(present_days))
+                / Decimal(working_days)
+                * Decimal("100")
+            ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         )
 
     return {
@@ -599,6 +650,7 @@ def employee_monthly_analytics(emp_code: str, month: str):
         "late_count": late_count,
         "attendance_pct": attendance_pct,
     }
+
 
 
 @app.get("/analytics/departments/summary")
@@ -1183,89 +1235,303 @@ def department_attendance_trend(
     }
 
 
+
 @app.get("/admin/explain/{endpoint}")
-def explain_query(endpoint: str):
+def explain_query(
+    endpoint: str,
+    emp_code: Optional[str] = None,
+    month: Optional[str] = None,
+    department: Optional[str] = None,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 20,
+    status: Optional[str] = None,
+    limit: int = 10,
+):
     allowed_endpoints = {
         "attendance_list",
         "employee_monthly",
         "department_summary",
         "late_leaderboard",
-        "department_trend"
+        "department_trend",
     }
 
     if endpoint not in allowed_endpoints:
         raise HTTPException(
             status_code=422,
-            detail=f"endpoint must be one of: {', '.join(sorted(allowed_endpoints))}"
+            detail=f"endpoint must be one of: {', '.join(sorted(allowed_endpoints))}",
         )
 
     try:
         if endpoint == "attendance_list":
-            result = db.command({
-                "explain": {
-                    "find": "attendance_logs",
-                    "filter": {"date": {"$gte": "2026-10-01", "$lte": "2026-10-31"}},
-                    "sort": {"date": 1, "emp_code": 1}
-                },
-                "verbosity": "executionStats"
-            })
+            if page < 1 or not 1 <= page_size <= 100:
+                raise HTTPException(
+                    status_code=422,
+                    detail="page must be >= 1 and page_size must be between 1 and 100",
+                )
+
+            query = {}
+            if emp_code:
+                query["emp_code"] = emp_code
+            if status:
+                query["status"] = status
+
+            date_filter = {}
+            if from_date:
+                date.fromisoformat(from_date)
+                date_filter["$gte"] = from_date
+            if to_date:
+                date.fromisoformat(to_date)
+                date_filter["$lte"] = to_date
+            if date_filter:
+                query["date"] = date_filter
+
+            if from_date and to_date and from_date > to_date:
+                raise HTTPException(
+                    status_code=422,
+                    detail="from_date must not be after to_date",
+                )
+
+            command = {
+                "find": "attendance_logs",
+                "filter": query,
+                "sort": {"date": 1, "emp_code": 1},
+                "skip": (page - 1) * page_size,
+                "limit": page_size,
+            }
 
         elif endpoint == "employee_monthly":
-            result = db.command({
-                "explain": {
-                    "find": "attendance_logs",
-                    "filter": {
-                        "emp_code": "EMP1001",
-                        "date": {"$gte": "2026-10-01", "$lte": "2026-10-31"}
-                    }
-                },
-                "verbosity": "executionStats"
-            })
+            if not emp_code:
+                raise HTTPException(
+                    status_code=422,
+                    detail="emp_code is required for employee_monthly",
+                )
+            if not month or not re.fullmatch(r"\d{4}-\d{2}", month):
+                raise HTTPException(
+                    status_code=422,
+                    detail="month=YYYY-MM is required for employee_monthly",
+                )
+
+            year, month_num = map(int, month.split("-"))
+            first_day = date(year, month_num, 1)
+            last_day = date(
+                year,
+                month_num,
+                calendar.monthrange(year, month_num)[1],
+            )
+            # Explain the same attendance-log match and aggregation grouping.
+            command = {
+                "aggregate": "attendance_logs",
+                "pipeline": [
+                    {
+                        "$match": {
+                            "emp_code": emp_code,
+                            "date": {
+                                "$gte": first_day.isoformat(),
+                                "$lte": last_day.isoformat(),
+                            },
+                        }
+                    },
+                    {
+                        "$group": {
+                            "_id": None,
+                            "log_count": {"$sum": 1},
+                            "late_count": {
+                                "$sum": {
+                                    "$cond": [
+                                        {"$gt": ["$late_minutes", 0]},
+                                        1,
+                                        0,
+                                    ]
+                                }
+                            },
+                        }
+                    },
+                ],
+                "cursor": {},
+            }
 
         elif endpoint == "department_summary":
-            result = db.command({
-                "explain": {
-                    "find": "employees",
-                    "filter": {"joined_on": {"$lte": "2026-10-31"}},
-                    "sort": {"department": 1}
-                },
-                "verbosity": "executionStats"
-            })
+            if not month or not re.fullmatch(r"\d{4}-\d{2}", month):
+                raise HTTPException(
+                    status_code=422,
+                    detail="month=YYYY-MM is required for department_summary",
+                )
+
+            year, month_num = map(int, month.split("-"))
+            period_end = date(
+                year,
+                month_num,
+                calendar.monthrange(year, month_num)[1],
+            ).isoformat()
+
+            employee_match = {"joined_on": {"$lte": period_end}}
+            if department:
+                employee_match["department"] = department
+
+            command = {
+                "aggregate": "employees",
+                "pipeline": [
+                    {"$match": employee_match},
+                    {
+                        "$lookup": {
+                            "from": "attendance_logs",
+                            "let": {"code": "$emp_code"},
+                            "pipeline": [
+                                {
+                                    "$match": {
+                                        "$expr": {
+                                            "$and": [
+                                                {"$eq": ["$emp_code", "$$code"]},
+                                                {
+                                                    "$gte": [
+                                                        "$date",
+                                                        period_end[:7] + "-01",
+                                                    ]
+                                                },
+                                                {"$lte": ["$date", period_end]},
+                                            ]
+                                        }
+                                    }
+                                }
+                            ],
+                            "as": "logs",
+                        }
+                    },
+                    {"$sort": {"department": 1}},
+                ],
+                "cursor": {},
+            }
 
         elif endpoint == "late_leaderboard":
-            result = db.command({
-                "explain": {
-                    "find": "attendance_logs",
-                    "filter": {
-                        "date": {"$gte": "2026-10-01", "$lte": "2026-10-31"},
-                        "late_minutes": {"$gt": 0}
+            if not month or not re.fullmatch(r"\d{4}-\d{2}", month):
+                raise HTTPException(
+                    status_code=422,
+                    detail="month=YYYY-MM is required for late_leaderboard",
+                )
+            if not 1 <= limit <= 100:
+                raise HTTPException(
+                    status_code=422,
+                    detail="limit must be between 1 and 100",
+                )
+
+            year, month_num = map(int, month.split("-"))
+            first_day = date(year, month_num, 1).isoformat()
+            last_day = date(
+                year,
+                month_num,
+                calendar.monthrange(year, month_num)[1],
+            ).isoformat()
+
+            match = {
+                "date": {"$gte": first_day, "$lte": last_day},
+                "late_minutes": {"$gt": 0},
+            }
+            if department:
+                employee_codes = [
+                    item["emp_code"]
+                    for item in db.employees.find(
+                        {"department": department},
+                        {"_id": 0, "emp_code": 1},
+                    )
+                ]
+                match["emp_code"] = {"$in": employee_codes}
+
+            command = {
+                "aggregate": "attendance_logs",
+                "pipeline": [
+                    {"$match": match},
+                    {
+                        "$group": {
+                            "_id": "$emp_code",
+                            "total_late_minutes": {"$sum": "$late_minutes"},
+                        }
                     },
-                    "sort": {"late_minutes": -1, "emp_code": 1}
-                },
-                "verbosity": "executionStats"
-            })
+                    {"$sort": {"total_late_minutes": -1, "_id": 1}},
+                    {"$limit": limit},
+                ],
+                "cursor": {},
+            }
 
-        else:
-            result = db.command({
-                "explain": {
-                    "aggregate": "attendance_logs",
-                    "pipeline": [
-                        {"$match": {
-                            "date": {"$gte": "2026-10-01", "$lte": "2026-10-31"}
-                        }},
-                        {"$limit": 100}
-                    ],
-                    "cursor": {}
-                },
-                "verbosity": "executionStats"
-            })
+        else:  # department_trend
+            if not department or not from_date or not to_date:
+                raise HTTPException(
+                    status_code=422,
+                    detail="department, from_date and to_date are required",
+                )
 
+            start = date.fromisoformat(from_date)
+            end = date.fromisoformat(to_date)
+            if end < start or (end - start).days > 91:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Date range must be valid and no longer than 92 days",
+                )
+
+            command = {
+                "aggregate": "attendance_logs",
+                "pipeline": [
+                    {
+                        "$match": {
+                            "date": {
+                                "$gte": start.isoformat(),
+                                "$lte": end.isoformat(),
+                            }
+                        }
+                    },
+                    {
+                        "$group": {
+                            "_id": "$date",
+                            "present_count": {
+                                "$sum": {
+                                    "$cond": [
+                                        {
+                                            "$in": [
+                                                "$status",
+                                                ["PRESENT", "WFH", "ON_DUTY"],
+                                            ]
+                                        },
+                                        1,
+                                        0,
+                                    ]
+                                }
+                            },
+                            "late_count": {
+                                "$sum": {
+                                    "$cond": [
+                                        {"$gt": ["$late_minutes", 0]},
+                                        1,
+                                        0,
+                                    ]
+                                }
+                            },
+                        }
+                    },
+                    {"$sort": {"_id": 1}},
+                ],
+                "cursor": {},
+            }
+
+        result = db.command({
+            "explain": command,
+            "verbosity": "executionStats",
+        })
         return make_json_safe(result)
+
+    except HTTPException:
+        raise
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid date or month format",
+        )
     except Exception as exc:
         raise HTTPException(
             status_code=500,
-            detail=f"Explain failed: {str(exc)}"
+            detail=f"Explain failed: {str(exc)}",
         )
+
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
