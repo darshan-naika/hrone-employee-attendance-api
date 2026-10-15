@@ -184,6 +184,12 @@ class PunchOutIn(BaseModel):
     emp_code: str
     punched_at: Optional[int] = None
 
+class AttendanceRegularizationIn(BaseModel):
+    status: Optional[str] = None
+    punch_in: Optional[int] = None
+    punch_out: Optional[int] = None
+    reason: str
+    regularized_by: str
 
 @app.post("/attendance/punch-out")
 def punch_out(body: PunchOutIn):
@@ -1532,7 +1538,178 @@ def explain_query(
             detail=f"Explain failed: {str(exc)}",
         )
 
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize_attendance(
+    emp_code: str,
+    date: str,
+    body: AttendanceRegularizationIn,
+):
+    from pymongo import ReturnDocument
 
+    try:
+        attendance_day = datetime.strptime(date, "%Y-%m-%d").date()
+        if attendance_day.isoformat() != date:
+            raise ValueError
+    except ValueError:
+        raise HTTPException(status_code=422, detail="date must use YYYY-MM-DD")
+
+    if not body.reason.strip() or not body.regularized_by.strip():
+        raise HTTPException(
+            status_code=422,
+            detail="reason and regularized_by must not be empty",
+        )
+
+    employee = db.employees.find_one({"emp_code": emp_code})
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    record = db.attendance_logs.find_one(
+        {"emp_code": emp_code, "date": date}
+    )
+    if not record:
+        raise HTTPException(status_code=404, detail="Attendance record not found")
+
+    allowed_statuses = {"PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"}
+    new_status = body.status if body.status is not None else record["status"]
+
+    if new_status not in allowed_statuses:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid status",
+        )
+
+    if new_status in {"ABSENT", "LEAVE"}:
+        if body.punch_in is not None or body.punch_out is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="ABSENT and LEAVE cannot have punch times",
+            )
+        new_in = None
+        new_out = None
+    else:
+        raw_in = body.punch_in
+        raw_out = body.punch_out
+
+        if raw_in is None:
+            new_in = record.get("punch_in")
+        else:
+            new_in = epoch_ms_to_ist(raw_in).astimezone(UTC)
+
+        if raw_out is None:
+            new_out = record.get("punch_out")
+        else:
+            new_out = epoch_ms_to_ist(raw_out).astimezone(UTC)
+
+        if new_in is None:
+            raise HTTPException(
+                status_code=422,
+                detail="A punch_in time is required for a presence status",
+            )
+
+        local_in = as_ist(new_in)
+        if local_in.date().isoformat() != date:
+            raise HTTPException(
+                status_code=422,
+                detail="punch_in must fall on the attendance date",
+            )
+
+        if new_out is not None:
+            if new_out <= new_in:
+                raise HTTPException(
+                    status_code=422,
+                    detail="punch_out must be after punch_in",
+                )
+            if (new_out - new_in).total_seconds() > 86400:
+                raise HTTPException(
+                    status_code=422,
+                    detail="punch_out cannot be more than 24 hours after punch_in",
+                )
+
+    changes = {}
+    if new_status != record["status"]:
+        changes["status"] = {"from": record["status"], "to": new_status}
+
+    old_in = record.get("punch_in")
+    old_out = record.get("punch_out")
+
+    def same_instant(a, b):
+        if a is None or b is None:
+            return a is b
+        return as_ist(a).replace(microsecond=0) == as_ist(b).replace(microsecond=0)
+
+    if not same_instant(old_in, new_in):
+        changes["punch_in"] = {
+            "from": int(as_ist(old_in).timestamp() * 1000) if old_in else None,
+            "to": int(as_ist(new_in).timestamp() * 1000) if new_in else None,
+        }
+
+    if not same_instant(old_out, new_out):
+        changes["punch_out"] = {
+            "from": int(as_ist(old_out).timestamp() * 1000) if old_out else None,
+            "to": int(as_ist(new_out).timestamp() * 1000) if new_out else None,
+        }
+
+    if not changes:
+        raise HTTPException(
+            status_code=422,
+            detail="No attendance changes supplied",
+        )
+
+    if new_in is not None and new_out is not None:
+        work_hours = compute_work_hours(new_in, new_out)
+        half_day = work_hours < 4.50
+        late_minutes = compute_late_minutes(new_in, employee["shift_start"])
+        overtime_minutes = compute_overtime(
+            new_out,
+            employee["shift_start"],
+            employee["shift_end"],
+            date,
+        )
+    else:
+        work_hours = None
+        half_day = False
+        late_minutes = 0
+        overtime_minutes = 0
+
+    update_fields = {
+        "status": new_status,
+        "punch_in": new_in,
+        "punch_out": new_out,
+        "work_hours": work_hours,
+        "half_day": half_day,
+        "late_minutes": late_minutes,
+        "overtime_minutes": overtime_minutes,
+    }
+
+    history_entry = {
+        "at": truncate_to_seconds(datetime.now(UTC)),
+        "by": body.regularized_by.strip(),
+        "reason": body.reason.strip(),
+        "changes": changes,
+    }
+
+    updated = db.attendance_logs.find_one_and_update(
+        {
+            "_id": record["_id"],
+            "status": record["status"],
+            "punch_in": record.get("punch_in"),
+            "punch_out": record.get("punch_out"),
+        },
+        {
+            "$set": update_fields,
+            "$push": {"history": history_entry},
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+
+    if updated is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Attendance record changed concurrently; retry the request",
+        )
+
+    updated.pop("_id", None)
+    return make_json_safe(updated)
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
 #   POST  /attendance/punch-out
